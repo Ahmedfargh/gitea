@@ -4,6 +4,8 @@
 package private
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"gitea.dev/models/db"
@@ -13,7 +15,10 @@ import (
 	"gitea.dev/models/unittest"
 	user_model "gitea.dev/models/user"
 	"gitea.dev/modules/git"
+	"gitea.dev/modules/git/gitcmd"
 	"gitea.dev/modules/private"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/test"
 	"gitea.dev/services/contexttest"
 
 	"github.com/stretchr/testify/assert"
@@ -112,4 +117,77 @@ func TestPreReceiveCanWriteCodePerBranch(t *testing.T) {
 	// scoped to PR head branches, so a non-branch ref can never match it. (A tag ref already
 	// yields an empty branch name, so this guards the per-ref evaluation, not the IsBranch check.)
 	assert.False(t, ctx.canWriteCodeRef(git.RefNameFromTag("granted-branch")))
+}
+
+func TestPreReceivePushProtection(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+
+	mockCtx, _ := contexttest.MockPrivateContext(t, "/")
+	ctx := &preReceiveContext{PrivateContext: mockCtx, opts: &private.HookOptions{UserID: 2}}
+	ctx.SetPathParam("owner", "user2")
+	ctx.SetPathParam("repo", "repo2")
+	RepoAssignment(ctx.PrivateContext)
+	require.False(t, ctx.Written())
+	defer ctx.Repo.GitRepo.Close()
+
+	loadContextDoerPermission(ctx.PrivateContext, 2, "")
+
+	oldCommitID := "1032bbf17fbc0d9c95bb5418dabe8f8c99278700"
+
+	blobID, _, err := gitcmd.NewCommand("hash-object", "-w", "--stdin").
+		WithStdinBytes([]byte("AWS_KEY=AKIAIOSFODNN7EXAMPLE\n")).
+		WithRepo(ctx.Repo.Repository).RunStdString(t.Context())
+	require.NoError(t, err)
+
+	treeInput := fmt.Sprintf("100644 blob %s\tsecret.txt\n", strings.TrimSpace(blobID))
+	treeID, _, err := gitcmd.NewCommand("mktree").
+		WithStdinBytes([]byte(treeInput)).
+		WithRepo(ctx.Repo.Repository).RunStdString(t.Context())
+	require.NoError(t, err)
+
+	commitWithSecret, _, err := gitcmd.NewCommand("commit-tree").
+		AddDynamicArguments(strings.TrimSpace(treeID)).
+		AddArguments("-p").AddDynamicArguments(oldCommitID).
+		AddArguments("-m").AddDynamicArguments("Commit with secret").
+		WithRepo(ctx.Repo.Repository).RunStdString(t.Context())
+	require.NoError(t, err)
+	commitWithSecret = strings.TrimSpace(commitWithSecret)
+
+	commitWithSkip, _, err := gitcmd.NewCommand("commit-tree").
+		AddDynamicArguments(strings.TrimSpace(treeID)).
+		AddArguments("-p").AddDynamicArguments(oldCommitID).
+		AddArguments("-m").AddDynamicArguments("Commit with secret [skip-secret-scan]").
+		WithRepo(ctx.Repo.Repository).RunStdString(t.Context())
+	require.NoError(t, err)
+	commitWithSkip = strings.TrimSpace(commitWithSkip)
+
+	t.Run("DisabledByDefault", func(t *testing.T) {
+		defer test.MockVariableValue(&setting.Security.EnablePushProtection, false)()
+		testCtx, _ := contexttest.MockPrivateContext(t, "/")
+		pCtx := &preReceiveContext{PrivateContext: testCtx, opts: &private.HookOptions{UserID: 2}}
+		pCtx.Repo = ctx.Repo
+		preReceiveBranch(pCtx, oldCommitID, commitWithSecret, git.RefNameFromBranch("test-secret"))
+		assert.False(t, pCtx.Written())
+	})
+
+	t.Run("EnabledRejectsSecret", func(t *testing.T) {
+		defer test.MockVariableValue(&setting.Security.EnablePushProtection, true)()
+		testCtx, testResp := contexttest.MockPrivateContext(t, "/")
+		pCtx := &preReceiveContext{PrivateContext: testCtx, opts: &private.HookOptions{UserID: 2}}
+		pCtx.Repo = ctx.Repo
+		preReceiveBranch(pCtx, oldCommitID, commitWithSecret, git.RefNameFromBranch("test-secret"))
+		assert.True(t, pCtx.Written())
+		assert.Contains(t, testResp.Body.String(), "Gitea Push Protection")
+		assert.Contains(t, testResp.Body.String(), "AWS Access Key ID")
+		assert.Contains(t, testResp.Body.String(), "AKIA************MPLE")
+	})
+
+	t.Run("EnabledAllowsWithSkipTrailer", func(t *testing.T) {
+		defer test.MockVariableValue(&setting.Security.EnablePushProtection, true)()
+		testCtx, _ := contexttest.MockPrivateContext(t, "/")
+		pCtx := &preReceiveContext{PrivateContext: testCtx, opts: &private.HookOptions{UserID: 2}}
+		pCtx.Repo = ctx.Repo
+		preReceiveBranch(pCtx, oldCommitID, commitWithSkip, git.RefNameFromBranch("test-secret"))
+		assert.False(t, pCtx.Written())
+	})
 }

@@ -23,10 +23,12 @@ var Security = struct {
 	ContentSecurityPolicyGeneral string // it only supports empty (default policy) or "unset", maybe it can support more in the future
 	EgressMode                   string
 	AllowedHostList              string
+	EnablePushProtection         bool
 }{
-	XFrameOptions:       "SAMEORIGIN",
-	XContentTypeOptions: "nosniff",
-	EgressMode:          "lax",
+	XFrameOptions:        "SAMEORIGIN",
+	XContentTypeOptions:  "nosniff",
+	EgressMode:           "lax",
+	EnablePushProtection: false,
 }
 
 // normalizePolicyMode validates a lax/strict egress policy EGRESS_MODE value, empty defaults to lax

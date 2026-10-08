@@ -15,6 +15,8 @@ import (
 	"gitea.dev/modules/git"
 	"gitea.dev/modules/git/gitcmd"
 	"gitea.dev/modules/private"
+	"gitea.dev/modules/secretscan"
+	"gitea.dev/modules/setting"
 	"gitea.dev/modules/util"
 	"gitea.dev/modules/web"
 	"gitea.dev/services/agit"
@@ -139,6 +141,12 @@ func preReceiveBranch(ctx *preReceiveContext, oldCommitID, newCommitID string, r
 	if branchName == defaultBranch && newCommitID == objectFormat.EmptyObjectID().String() {
 		ctx.PrivateUserErrorf(http.StatusForbidden, "Branch %s is the default branch and cannot be deleted", branchName)
 		return
+	}
+
+	if newCommitID != objectFormat.EmptyObjectID().String() && setting.Security.EnablePushProtection {
+		if !checkPushProtection(ctx, oldCommitID, newCommitID) {
+			return
+		}
 	}
 
 	protectBranch, err := git_model.GetFirstMatchProtectedBranchRule(ctx, repo.ID, branchName)
@@ -382,4 +390,38 @@ func generateGitEnv(opts *private.HookOptions) (env []string) {
 			private.GitQuarantinePath+"="+opts.GitQuarantinePath)
 	}
 	return env
+}
+
+func checkPushProtection(ctx *preReceiveContext, oldCommitID, newCommitID string) bool {
+	repo := ctx.Repo.Repository
+	objectFormat := ctx.Repo.GetObjectFormat()
+	emptyID := objectFormat.EmptyObjectID().String()
+
+	cmd := gitcmd.NewCommand("log", "-p", "-U0", "--no-color")
+	if oldCommitID == emptyID || oldCommitID == "" {
+		cmd.AddDynamicArguments(newCommitID).AddArguments("--not", "--branches", "--tags")
+	} else {
+		cmd.AddDynamicArguments(oldCommitID + ".." + newCommitID)
+	}
+
+	stdoutReader, stdoutReaderClose := cmd.MakeStdoutPipe()
+	defer stdoutReaderClose()
+
+	var findings []secretscan.Finding
+	err := cmd.WithEnv(ctx.env).WithRepo(repo).
+		WithPipelineFunc(func(gitCtx gitcmd.Context) error {
+			var scanErr error
+			findings, scanErr = secretscan.ScanPatch(stdoutReader)
+			return scanErr
+		}).Run(ctx)
+	if err != nil {
+		ctx.PrivateInternalErrorf("checkPushProtection: %v", err)
+		return false
+	}
+
+	if len(findings) > 0 {
+		ctx.PrivateUserErrorf(http.StatusForbidden, "%s", secretscan.FormatFindings(findings))
+		return false
+	}
+	return true
 }
